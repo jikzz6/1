@@ -1,0 +1,156 @@
+# -*- coding:utf-8 -*-
+import cv2
+import numpy as np
+import pytesseract
+import re
+from picamera2 import Picamera2
+from PIL import Image
+import time
+import requests
+
+# Tesseract 설정 (한글+영어)
+tesseract_config = '--oem 3 --psm 7 -l kor+eng'
+
+# 서버 설정
+SERVER_URL = "http://192.168.24.132:8000/api/plate-recognition/detect"
+
+last_detected_plate = None
+last_detection_time = None
+DETECTION_COOLDOWN = 10  # 같은 번호판 재인식 대기 시간(초)
+
+def is_valid_plate(text):
+    text = text.replace(" ", "").strip()
+    pattern = r"^\d{2,3}[가-힣]{1}\d{4}$"
+    return re.match(pattern, text) is not None
+
+def preprocess(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    _, _, value = cv2.split(hsv)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    topHat = cv2.morphologyEx(value, cv2.MORPH_TOPHAT, kernel)
+    blackHat = cv2.morphologyEx(value, cv2.MORPH_BLACKHAT, kernel)
+    add = cv2.add(value, topHat)
+    subtract = cv2.subtract(add, blackHat)
+    blur = cv2.GaussianBlur(subtract, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV, 19, 9)
+    dilate = cv2.dilate(thresh, kernel, iterations=1)
+    return dilate, value
+
+def extract_plate(value_img, cnt):
+    rect = cv2.minAreaRect(cnt)
+    box = cv2.boxPoints(rect)
+    box = np.intp(box)
+
+    angle = rect[2]
+    if angle < -45:
+        angle += 90
+
+    center = rect[0]
+    size = (int(rect[1][0]), int(rect[1][1]))
+    if size[0] == 0 or size[1] == 0:
+        return None
+
+    M = cv2.getRotationMatrix2D((size[0] // 2, size[1] // 2), angle, 1.0)
+    cropped = cv2.getRectSubPix(value_img, size, center)
+    rotated = cv2.warpAffine(cropped, M, size)
+    plate_img = cv2.getRectSubPix(rotated, size, (size[0] // 2, size[1] // 2))
+    return plate_img
+
+def send_to_server(plate_number):
+    try:
+        response = requests.post(SERVER_URL, json={"plateNumber": plate_number}, timeout=3)
+        print("서버 응답 코드:", response.status_code)
+        print("서버 응답 내용:", response.text)
+        if response.status_code == 200:
+            try:
+                data = response.json()
+                print("서버 응답 JSON:", data)
+                if data.get("success", False):
+                    print(f"✅ 입차 성공: {plate_number}")
+                    return True
+                else:
+                    print(f"❌ 입차 실패(서버 응답): {data}")
+                    return False
+            except Exception as e:
+                print(f"❌ 서버 응답 파싱 오류: {e}")
+                return False
+        else:
+            print(f"❌ 서버 전송 실패: {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"❌ 서버 통신 오류: {str(e)}")
+        return False
+
+def should_process_plate(text):
+    global last_detected_plate, last_detection_time
+    current_time = time.time()
+    if (last_detected_plate == text and 
+        last_detection_time and 
+        current_time - last_detection_time < DETECTION_COOLDOWN):
+        print("쿨타임으로 인해 무시됨:", text)
+        return False
+    last_detected_plate = text
+    last_detection_time = current_time
+    return True
+
+def detect_and_ocr(frame):
+    dilated, value = preprocess(frame)
+    contours, _ = cv2.findContours(dilated, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    for cnt in contours:
+        if cv2.contourArea(cnt) < 1000:
+            continue
+
+        x, y, w, h = cv2.boundingRect(cnt)
+        ratio = w / float(h)
+        if 2.5 < ratio < 6.5:
+            plate_img = extract_plate(value, cnt)
+            if plate_img is None:
+                continue
+
+            pil_img = Image.fromarray(plate_img)
+            text = pytesseract.image_to_string(pil_img, config=tesseract_config)
+            text = text.strip()
+
+            print("OCR 결과:", text)
+
+            if is_valid_plate(text) and should_process_plate(text):
+                print("📷 감지된 번호판:", text)
+                send_to_server(text)   # 입차 성공 여부만 확인
+                # 화면 표시 등...
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                cv2.putText(frame, text, (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    return frame
+
+# Picamera2 설정
+picam2 = Picamera2()
+config = picam2.create_video_configuration(
+    main={"size": (1280, 720), "format": "RGB888"},
+    lores={"size": (640, 480), "format": "YUV420"},
+    controls={"ScalerCrop": (0, 0, 0, 0)},
+    buffer_count=3
+)
+picam2.configure(config)
+picam2.start()
+time.sleep(2)
+
+print("🚗 차량 번호판 인식 시작... (종료: ESC 또는 Ctrl+C)")
+
+try:
+    while True:
+        try:
+            frame = picam2.capture_array()
+            result = detect_and_ocr(frame)
+            cv2.imshow("License Plate Detection", result)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+        except Exception as e:
+            print("루프 내부 예외:", e)
+            time.sleep(1)  # 예외 발생 시 1초 쉬고 계속
+except KeyboardInterrupt:
+    print("\n🛑 프로그램 종료")
+finally:
+    picam2.stop()
+    cv2.destroyAllWindows()

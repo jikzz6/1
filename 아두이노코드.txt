@@ -1,0 +1,17 @@
+#include <Servo.h>
+Servo servo;
+int angle = 180; // 기본 닫힘(닫힌 각도)
+
+void setup() {
+  servo.attach(2);      // 서보 신호선: 아두이노 2번 핀
+  Serial.begin(9600);   // 시리얼 통신 시작
+  servo.write(angle);   // 처음엔 닫힘 상태
+}
+
+void loop() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n'); // 한 줄 단위로 명령 읽기
+    command.trim(); // 공백 제거
+    if (command == "open") {
+      angle = 70;           // 열림 각도
+   
